@@ -248,19 +248,45 @@ class OpenAIWebSocketClient:
     ) -> str:
         """Receive transcript events until the manually committed turn completes."""
         deltas_by_item: dict[str, list[str]] = {}
-        commit_time = 0.0
+        commit_time: float | None = None
 
         while True:
-            # Poll while audio is still arriving so the timeout starts only after
-            # Home Assistant has ended and committed the command.
-            timeout = WEBSOCKET_RESPONSE_TIMEOUT if commit_sent.is_set() else 1
-            if commit_sent.is_set() and commit_time == 0:
-                commit_time = time.perf_counter()
+            # While audio is arriving, receive() is polled once per second. The
+            # commit can happen during such a poll. In that case its one-second
+            # TimeoutError must start the real post-commit timeout, not be treated
+            # as if all 30 seconds had already elapsed.
+            now = time.perf_counter()
+            if commit_sent.is_set():
+                if commit_time is None:
+                    commit_time = now
+                remaining = WEBSOCKET_RESPONSE_TIMEOUT - (now - commit_time)
+                if remaining <= 0:
+                    raise OpenAIRealtimeError(
+                        "Timed out waiting for transcription after audio commit"
+                    )
+                timeout = remaining
+            else:
+                timeout = 1
 
             try:
                 msg = await ws.receive(timeout=timeout)
             except TimeoutError:
-                if commit_sent.is_set():
+                if not commit_sent.is_set():
+                    continue
+
+                if commit_time is None:
+                    # The commit occurred while receive() was still using its
+                    # one-second pre-commit polling timeout. Start a fresh full
+                    # response timeout now.
+                    commit_time = time.perf_counter()
+                    _LOGGER.debug(
+                        "Audio commit occurred during receive poll; starting %.0f "
+                        "second transcription timeout",
+                        WEBSOCKET_RESPONSE_TIMEOUT,
+                    )
+                    continue
+
+                if time.perf_counter() - commit_time >= WEBSOCKET_RESPONSE_TIMEOUT:
                     raise OpenAIRealtimeError(
                         "Timed out waiting for transcription after audio commit"
                     )
@@ -305,7 +331,13 @@ class OpenAIWebSocketClient:
                     if not transcript:
                         transcript = "".join(deltas_by_item.get(item_id, [])).strip()
 
-                    duration = time.perf_counter() - commit_time
+                    # A completion may arrive in the same receive() call during
+                    # which commit_sent changed, before commit_time was initialized.
+                    duration = (
+                        time.perf_counter() - commit_time
+                        if commit_time is not None
+                        else 0.0
+                    )
                     _LOGGER.debug(
                         'Final Realtime transcript after %.2f seconds: "%s"',
                         duration,
