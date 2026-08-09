@@ -45,6 +45,8 @@ SUPPORTED_MODELS = [
     "whisper-1",
     "gpt-4o-mini-transcribe",
     "gpt-4o-transcribe",
+    "gpt-live-transcribe",
+    "gpt-transcribe",
 ]
 
 SUPPORTED_NOISE_REDUCTION = [

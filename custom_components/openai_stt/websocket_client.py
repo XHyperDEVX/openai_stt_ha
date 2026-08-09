@@ -1,27 +1,116 @@
-"""WebSocket client for OpenAI STT."""
+"""WebSocket client for OpenAI Realtime transcription."""
 
 from __future__ import annotations
 
 import asyncio
+from array import array
 import base64
 from collections.abc import AsyncIterable
 import json
 import logging
+import math
+import sys
 import time
 from typing import Final
 
-from aiohttp import ClientError, WSCloseCode, WSMsgType
+from aiohttp import ClientError, WSMsgType
 
 from homeassistant.components.stt import SpeechMetadata, SpeechResult, SpeechResultState
 
 _LOGGER = logging.getLogger(__name__)
 
-# Maximum time to wait for a response (in seconds)
-WEBSOCKET_TIMEOUT: Final = 30
+OPENAI_SAMPLE_RATE: Final = 24000
+WEBSOCKET_RESPONSE_TIMEOUT: Final = 30
+
+# The current Realtime transcription API uses different model names than the
+# file-transcription API. Keep existing configurations working by translating
+# the old names when realtime mode is enabled.
+REALTIME_MODEL_ALIASES: Final = {
+    "gpt-4o-mini-transcribe": "gpt-live-transcribe",
+    "gpt-4o-transcribe": "gpt-transcribe",
+    "whisper-1": "gpt-live-transcribe",
+}
+
+
+class OpenAIRealtimeError(RuntimeError):
+    """Raised when the Realtime API reports an error."""
+
+
+class PCM16Resampler:
+    """Small stateful mono PCM16 linear resampler.
+
+    Home Assistant Voice satellites normally provide 16 kHz PCM, while the
+    current OpenAI Realtime transcription API requires 24 kHz PCM. State is
+    retained between chunks so chunk boundaries do not introduce gaps.
+    """
+
+    def __init__(self, input_rate: int, output_rate: int) -> None:
+        self._input_rate = input_rate
+        self._output_rate = output_rate
+        self._step = input_rate / output_rate
+        self._next_output_position = 0.0
+        self._input_samples_seen = 0
+        self._previous_sample: int | None = None
+        self._pending_byte = b""
+
+    def process(self, pcm: bytes) -> bytes:
+        """Resample one little-endian PCM16 chunk."""
+        if not pcm:
+            return b""
+
+        pcm = self._pending_byte + pcm
+        if len(pcm) % 2:
+            self._pending_byte = pcm[-1:]
+            pcm = pcm[:-1]
+        else:
+            self._pending_byte = b""
+
+        if not pcm:
+            return b""
+
+        samples = array("h")
+        samples.frombytes(pcm)
+        if sys.byteorder != "little":
+            samples.byteswap()
+
+        start_index = self._input_samples_seen
+        end_index = start_index + len(samples) - 1
+        output = array("h")
+
+        while self._next_output_position <= end_index + 1e-9:
+            left_index = math.floor(self._next_output_position)
+            fraction = self._next_output_position - left_index
+
+            if left_index < start_index:
+                if self._previous_sample is None:
+                    break
+                left = self._previous_sample
+            else:
+                left = samples[left_index - start_index]
+
+            if fraction <= 1e-9:
+                value = left
+            else:
+                right_index = left_index + 1
+                if right_index > end_index:
+                    # The next chunk supplies the right-hand sample.
+                    break
+                right = samples[right_index - start_index]
+                value = round(left + (right - left) * fraction)
+
+            output.append(max(-32768, min(32767, value)))
+            self._next_output_position += self._step
+
+        self._input_samples_seen += len(samples)
+        self._previous_sample = samples[-1]
+
+        if sys.byteorder != "little":
+            output.byteswap()
+        return output.tobytes()
 
 
 class OpenAIWebSocketClient:
-    """WebSocket client for OpenAI STT API."""
+    """WebSocket client for the current OpenAI Realtime transcription API."""
 
     def __init__(
         self,
@@ -30,221 +119,291 @@ class OpenAIWebSocketClient:
         api_url: str,
         model: str,
         prompt: str,
-        noise_reduction: str,
+        noise_reduction: str | None,
     ) -> None:
         """Initialize the WebSocket client."""
         self.client = client
         self.api_key = api_key
-        self.api_url = api_url
-        self.model = model
+        self.api_url = api_url.rstrip("/")
+        self.transcription_model = REALTIME_MODEL_ALIASES.get(model, model)
         self.prompt = prompt
         self.noise_reduction = noise_reduction
-        self.start_time = 0.0
-        self.ws = None
 
-    async def _send_audio_stream(self, stream: AsyncIterable[bytes]) -> None:
-        """Send audio chunks to WebSocket server."""
-        try:
-            async for chunk in stream:
-                if not chunk or self.ws.closed:
-                    break
-                # Audio data must be base64 encoded
-                b64 = base64.b64encode(chunk).decode("utf-8")
-                await self.ws.send_json(
-                    {
-                        "type": "input_audio_buffer.append",
-                        "audio": b64,
-                    }
-                )
-                _LOGGER.debug("Audio sent (%d bytes)", len(chunk))
-
-            if not self.ws.closed:
-                # Signal the end of the audio stream to the server
-                _LOGGER.debug("Sending end-of-stream signal")
-                await self.ws.send_json({"type": "input_audio_buffer.commit"})
-
-                # Set start time after sending all audio data
-                self.start_time = time.perf_counter()
-
-        except asyncio.CancelledError:
-            _LOGGER.debug("send_audio() was cancelled")
-        except Exception:
-            _LOGGER.exception("Error sending audio")
-            if not self.ws.closed:
-                await self.ws.close(
-                    code=WSCloseCode.INTERNAL_ERROR,
-                    message=b"Error sending audio",
-                )
-
-    async def _receive_transcription(self, send_task: asyncio.Task) -> str:
-        """Receive transcription results from WebSocket server."""
-        final_text = ""
-        try:
-            async with asyncio.timeout(WEBSOCKET_TIMEOUT):
-                async for msg in self.ws:
-                    if msg.type == WSMsgType.TEXT:
-                        data = json.loads(msg.data)
-                        msg_type = data.get("type")
-                        _LOGGER.debug("Received response: %s", data)
-
-                        if (
-                            msg_type
-                            == "conversation.item.input_audio_transcription.delta"
-                        ):
-                            _LOGGER.debug('Partial: "%s"', data.get("delta"))
-                        elif (
-                            msg_type
-                            == "conversation.item.input_audio_transcription.completed"
-                        ):
-                            # Get final transcription
-                            final_text = data.get("transcript", "")
-                            if (
-                                self.start_time > 0
-                            ):  # Only calculate if start_time is set
-                                duration = time.perf_counter() - self.start_time
-                                _LOGGER.debug(
-                                    "Transcription processing duration: %.2f seconds",
-                                    duration,
-                                )
-                            else:
-                                _LOGGER.debug(
-                                    "Could not calculate processing duration: start_time not set"
-                                )
-                            _LOGGER.debug('Final: "%s"', final_text)
-                            return final_text
-                    elif msg.type == WSMsgType.ERROR:
-                        _LOGGER.error("WebSocket error: %s", self.ws.exception())
-                        break
-                    elif msg.type == WSMsgType.CLOSED:
-                        _LOGGER.debug("WebSocket closed by server")
-                        break
-        except TimeoutError:
-            _LOGGER.warning("Timeout waiting for transcription response")
-        except asyncio.CancelledError:
-            _LOGGER.debug("receive_transcription() was cancelled")
-        except Exception:
-            _LOGGER.exception("Error receiving transcription")
-        finally:
-            if not send_task.done():
-                send_task.cancel()
-
-        return final_text
+        if self.transcription_model != model:
+            _LOGGER.info(
+                "Realtime transcription model %s is now mapped to %s",
+                model,
+                self.transcription_model,
+            )
 
     def _create_session_config(self, language: str) -> dict:
-        """Create configuration for the transcription session."""
-        config = {
-            "type": "transcription_session.update",
-            "session": {
-                "input_audio_format": "pcm16",
-                "input_audio_transcription": {
-                    "model": self.model,
-                    "prompt": self.prompt,
-                    "language": language,
-                },
-                "turn_detection": {
-                    "type": "server_vad",
-                    "prefix_padding_ms": 300,
-                    "silence_duration_ms": 500,
-                    "threshold": 0.5,
-                },
+        """Create a session.update event for the current Realtime API."""
+        transcription: dict = {"model": self.transcription_model}
+
+        if self.prompt:
+            transcription["prompt"] = self.prompt
+
+        # gpt-live-transcribe supports language hints through the plural
+        # `languages` field. gpt-transcribe detects the language after commit.
+        if self.transcription_model == "gpt-live-transcribe" and language:
+            transcription["languages"] = [language]
+
+        audio_input: dict = {
+            "format": {
+                "type": "audio/pcm",
+                "rate": OPENAI_SAMPLE_RATE,
             },
+            "transcription": transcription,
+            # Home Assistant owns the turn boundary. OpenAI must not commit on
+            # the short pause between the wake word and the actual command.
+            "turn_detection": None,
         }
 
         if self.noise_reduction:
-            config["session"]["input_audio_noise_reduction"] = {
-                "type": self.noise_reduction
-            }
-        else:
-            config["session"]["input_audio_noise_reduction"] = None
+            audio_input["noise_reduction"] = {"type": self.noise_reduction}
 
-        return config
+        return {
+            "type": "session.update",
+            "session": {
+                "type": "transcription",
+                "audio": {"input": audio_input},
+            },
+        }
 
-    async def _handle_tasks(
-        self, send_task: asyncio.Task, recv_task: asyncio.Task
-    ) -> None:
-        """Handle task completion and cancellation logic."""
+    @staticmethod
+    def _api_error_message(data: dict) -> str:
+        """Extract a useful message from a Realtime error event."""
+        error = data.get("error", {})
+        if isinstance(error, dict):
+            code = error.get("code") or error.get("type") or "unknown_error"
+            message = error.get("message") or str(error)
+            return f"{code}: {message}"
+        return str(error or data)
+
+    async def _send_audio_stream(
+        self,
+        ws,
+        metadata: SpeechMetadata,
+        stream: AsyncIterable[bytes],
+        commit_sent: asyncio.Event,
+    ) -> int:
+        """Resample, send and finally commit Home Assistant's audio stream."""
+        input_rate = int(metadata.sample_rate)
+        if int(metadata.channel) != 1 or int(metadata.bit_rate) != 16:
+            raise OpenAIRealtimeError(
+                "Realtime transcription requires mono 16-bit PCM input; "
+                f"received channels={metadata.channel}, bit_rate={metadata.bit_rate}"
+            )
+
+        resampler = PCM16Resampler(input_rate, OPENAI_SAMPLE_RATE)
+        input_bytes = 0
+        output_bytes = 0
+
+        async for chunk in stream:
+            if ws.closed:
+                raise OpenAIRealtimeError("WebSocket closed while sending audio")
+            if not chunk:
+                # Only exhaustion of the async iterator marks end-of-stream.
+                continue
+
+            input_bytes += len(chunk)
+            openai_pcm = (
+                chunk
+                if input_rate == OPENAI_SAMPLE_RATE
+                else resampler.process(chunk)
+            )
+            if not openai_pcm:
+                continue
+
+            output_bytes += len(openai_pcm)
+            await ws.send_json(
+                {
+                    "type": "input_audio_buffer.append",
+                    "audio": base64.b64encode(openai_pcm).decode("ascii"),
+                }
+            )
+
+        _LOGGER.debug(
+            "Audio stream ended: %d input bytes at %d Hz, %d output bytes at %d Hz",
+            input_bytes,
+            input_rate,
+            output_bytes,
+            OPENAI_SAMPLE_RATE,
+        )
+
+        if output_bytes == 0:
+            return 0
+
+        # Set the event first. This prevents a very fast completion response
+        # from being mistaken for an unsolicited pre-commit completion.
+        commit_sent.set()
+        await ws.send_json({"type": "input_audio_buffer.commit"})
+        _LOGGER.debug("Committed OpenAI input audio buffer")
+        return output_bytes
+
+    async def _receive_transcription(
+        self,
+        ws,
+        commit_sent: asyncio.Event,
+    ) -> str:
+        """Receive transcript events until the manually committed turn completes."""
+        deltas_by_item: dict[str, list[str]] = {}
+        commit_time = 0.0
+
+        while True:
+            # Poll while audio is still arriving so the timeout starts only after
+            # Home Assistant has ended and committed the command.
+            timeout = WEBSOCKET_RESPONSE_TIMEOUT if commit_sent.is_set() else 1
+            if commit_sent.is_set() and commit_time == 0:
+                commit_time = time.perf_counter()
+
+            try:
+                msg = await ws.receive(timeout=timeout)
+            except TimeoutError:
+                if commit_sent.is_set():
+                    raise OpenAIRealtimeError(
+                        "Timed out waiting for transcription after audio commit"
+                    )
+                continue
+
+            if msg.type == WSMsgType.TEXT:
+                data = json.loads(msg.data)
+                event_type = data.get("type", "")
+                _LOGGER.debug("Received Realtime event: %s", data)
+
+                if event_type == "error":
+                    raise OpenAIRealtimeError(self._api_error_message(data))
+
+                if event_type == "session.updated":
+                    _LOGGER.debug("OpenAI Realtime transcription session configured")
+                    continue
+
+                if (
+                    event_type
+                    == "conversation.item.input_audio_transcription.delta"
+                ):
+                    item_id = data.get("item_id", "")
+                    delta = data.get("delta", "")
+                    if delta:
+                        deltas_by_item.setdefault(item_id, []).append(delta)
+                    continue
+
+                if (
+                    event_type
+                    == "conversation.item.input_audio_transcription.completed"
+                ):
+                    if not commit_sent.is_set():
+                        # This should be impossible with turn_detection=null, but do
+                        # not let a stray event terminate the Voice PE microphone.
+                        _LOGGER.warning(
+                            "Ignoring transcription completion received before commit"
+                        )
+                        continue
+
+                    item_id = data.get("item_id", "")
+                    transcript = (data.get("transcript") or "").strip()
+                    if not transcript:
+                        transcript = "".join(deltas_by_item.get(item_id, [])).strip()
+
+                    duration = time.perf_counter() - commit_time
+                    _LOGGER.debug(
+                        'Final Realtime transcript after %.2f seconds: "%s"',
+                        duration,
+                        transcript,
+                    )
+                    return transcript
+
+                continue
+
+            if msg.type == WSMsgType.ERROR:
+                raise OpenAIRealtimeError(f"WebSocket error: {ws.exception()}")
+
+            if msg.type in (
+                WSMsgType.CLOSE,
+                WSMsgType.CLOSING,
+                WSMsgType.CLOSED,
+            ):
+                raise OpenAIRealtimeError(
+                    f"WebSocket closed before transcription completed "
+                    f"(code={ws.close_code})"
+                )
+
+    async def _run_stream(self, ws, metadata, stream) -> str:
+        """Run sender and receiver while propagating either task's errors."""
+        commit_sent = asyncio.Event()
+        send_task = asyncio.create_task(
+            self._send_audio_stream(ws, metadata, stream, commit_sent)
+        )
+        receive_task = asyncio.create_task(
+            self._receive_transcription(ws, commit_sent)
+        )
+
         try:
-            done, pending = await asyncio.wait(
-                [send_task, recv_task],
+            done, _ = await asyncio.wait(
+                (send_task, receive_task),
                 return_when=asyncio.FIRST_COMPLETED,
             )
 
-            # Handle task completion and cancellation
-            if recv_task in done:
-                _LOGGER.debug("Transcription finished - cancelling audio task")
-                if not send_task.done():
-                    send_task.cancel()
-                await asyncio.gather(send_task, return_exceptions=True)
-            elif send_task in done:
-                _LOGGER.debug("Audio finished - waiting for final transcription")
-                await recv_task
-            else:
-                _LOGGER.warning(
-                    "Unexpected state in task completion, ensuring tasks are awaited/cancelled"
-                )
-                for task in pending:
-                    if not task.done():
-                        task.cancel()
-                await asyncio.gather(*pending, return_exceptions=True)
+            if receive_task in done:
+                # Usually an API/configuration error. Do not hide it as an empty
+                # successful transcript.
+                transcript = receive_task.result()
+                await send_task
+                return transcript
 
-            for task in done:
-                if task.exception():
-                    _LOGGER.error("Task completed with exception: %s", task.exception())
+            output_bytes = send_task.result()
+            if output_bytes == 0:
+                receive_task.cancel()
+                await asyncio.gather(receive_task, return_exceptions=True)
+                return ""
+
+            return await receive_task
         finally:
-            if not self.ws.closed:
-                try:
-                    await self.ws.close()
-                    _LOGGER.debug("WebSocket closed cleanly")
-                except Exception:
-                    _LOGGER.exception("Error closing WebSocket connection")
+            for task in (send_task, receive_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(send_task, receive_task, return_exceptions=True)
 
     async def async_process_audio_stream(
         self, metadata: SpeechMetadata, stream: AsyncIterable[bytes]
     ) -> SpeechResult:
-        """Process audio stream via WebSocket to OpenAI Realtime API."""
-
+        """Process an Assist audio stream through OpenAI Realtime transcription."""
+        # Select the dedicated GA transcription session during the WebSocket
+        # handshake. Without intent=transcription, OpenAI creates a normal
+        # Realtime conversation session and rejects session.type=transcription.
+        # No model belongs in this URL; the STT model is supplied in
+        # session.audio.input.transcription.model.
         uri = f"{self.api_url}/realtime?intent=transcription"
+        # The current /v1/realtime endpoint is GA. Sending the former
+        # `OpenAI-Beta: realtime=v1` header forces the retired Beta API shape
+        # and is rejected with `beta_api_shape_disabled`.
         headers = {
             "Authorization": f"Bearer {self.api_key}",
-            "OpenAI-Beta": "realtime=v1",
         }
 
         try:
-            _LOGGER.debug("Opening WebSocket connection to %s", uri)
-            async with self.client.ws_connect(uri, headers=headers, heartbeat=30) as ws:
-                self.ws = ws
-                self.start_time = 0  # Reset start_time
-
-                # Send initial configuration
+            _LOGGER.debug("Opening OpenAI Realtime WebSocket at %s", uri)
+            async with self.client.ws_connect(
+                uri,
+                headers=headers,
+                heartbeat=30,
+            ) as ws:
                 config = self._create_session_config(metadata.language)
-                _LOGGER.debug("Sending configuration: %s", config)
+                _LOGGER.debug("Sending Realtime session configuration: %s", config)
                 await ws.send_json(config)
 
-                # Create and manage concurrent tasks
-                send_task = asyncio.create_task(self._send_audio_stream(stream))
-                recv_task = asyncio.create_task(self._receive_transcription(send_task))
-
-                # Handle tasks completion
-                await self._handle_tasks(send_task, recv_task)
-
-                # Process final result
-                if not recv_task.done():
-                    _LOGGER.warning("Transcription task was not completed")
-                    return SpeechResult("", SpeechResultState.SUCCESS)
-
-                final_text = recv_task.result().strip()
-
-                _LOGGER.debug('Transcription completed: "%s"', final_text)
-
+                final_text = (await self._run_stream(ws, metadata, stream)).strip()
                 if not final_text:
                     _LOGGER.warning("WebSocket transcription resulted in empty text")
                     return SpeechResult("", SpeechResultState.SUCCESS)
 
                 return SpeechResult(final_text, SpeechResultState.SUCCESS)
 
-        except ClientError as err:
-            _LOGGER.error("WebSocket connection error: %s", err)
+        except asyncio.CancelledError:
+            raise
+        except (ClientError, OpenAIRealtimeError) as err:
+            _LOGGER.error("OpenAI Realtime transcription failed: %s", err)
             return SpeechResult("", SpeechResultState.ERROR)
         except Exception:
-            _LOGGER.exception("Unexpected error in WebSocket communication")
+            _LOGGER.exception("Unexpected error in OpenAI Realtime transcription")
             return SpeechResult("", SpeechResultState.ERROR)
