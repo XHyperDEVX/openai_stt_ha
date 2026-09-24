@@ -5,17 +5,19 @@ from __future__ import annotations
 import asyncio
 from array import array
 import base64
-from collections.abc import AsyncIterable
+from collections.abc import AsyncIterable, Awaitable, Callable
 import json
 import logging
 import math
 import sys
 import time
-from typing import Final
+from typing import Any, Final
 
 from aiohttp import ClientError, WSMsgType
 
 from homeassistant.components.stt import SpeechMetadata, SpeechResult, SpeechResultState
+
+from .debug_audio import async_save_debug_audio
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -120,6 +122,9 @@ class OpenAIWebSocketClient:
         model: str,
         prompt: str,
         noise_reduction: str | None,
+        *,
+        debug_directory: str | None = None,
+        executor: Callable[..., Awaitable[Any]] | None = None,
     ) -> None:
         """Initialize the WebSocket client."""
         self.client = client
@@ -128,6 +133,8 @@ class OpenAIWebSocketClient:
         self.transcription_model = REALTIME_MODEL_ALIASES.get(model, model)
         self.prompt = prompt
         self.noise_reduction = noise_reduction
+        self.debug_directory = debug_directory
+        self._executor = executor
 
         if self.transcription_model != model:
             _LOGGER.info(
@@ -199,29 +206,46 @@ class OpenAIWebSocketClient:
         input_bytes = 0
         output_bytes = 0
 
-        async for chunk in stream:
-            if ws.closed:
-                raise OpenAIRealtimeError("WebSocket closed while sending audio")
-            if not chunk:
-                # Only exhaustion of the async iterator marks end-of-stream.
-                continue
+        # This is AFTER local voice effects AND conversion to OpenAI's 24 kHz.
+        # Allocate a recording buffer only when explicitly requested.
+        recording = bytearray() if self.debug_directory is not None else None
+        try:
+            async for chunk in stream:
+                if ws.closed:
+                    raise OpenAIRealtimeError("WebSocket closed while sending audio")
+                if not chunk:
+                    # Only exhaustion of the async iterator marks end-of-stream.
+                    continue
 
-            input_bytes += len(chunk)
-            openai_pcm = (
-                chunk
-                if input_rate == OPENAI_SAMPLE_RATE
-                else resampler.process(chunk)
-            )
-            if not openai_pcm:
-                continue
+                input_bytes += len(chunk)
+                openai_pcm = (
+                    chunk
+                    if input_rate == OPENAI_SAMPLE_RATE
+                    else resampler.process(chunk)
+                )
+                if not openai_pcm:
+                    continue
 
-            output_bytes += len(openai_pcm)
-            await ws.send_json(
-                {
-                    "type": "input_audio_buffer.append",
-                    "audio": base64.b64encode(openai_pcm).decode("ascii"),
-                }
-            )
+                await ws.send_json(
+                    {
+                        "type": "input_audio_buffer.append",
+                        "audio": base64.b64encode(openai_pcm).decode("ascii"),
+                    }
+                )
+                output_bytes += len(openai_pcm)
+                if recording is not None:
+                    recording.extend(openai_pcm)
+        finally:
+            # On errors, save only successfully appended chunks. The WAV header
+            # is local; its frames are byte-for-byte the outgoing PCM payload.
+            if recording:
+                await async_save_debug_audio(
+                    self.debug_directory,
+                    recording,
+                    "realtime",
+                    sample_rate=OPENAI_SAMPLE_RATE,
+                    executor=self._executor,
+                )
 
         _LOGGER.debug(
             "Audio stream ended: %d input bytes at %d Hz, %d output bytes at %d Hz",

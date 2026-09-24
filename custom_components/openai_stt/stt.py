@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterable
 import logging
+import math
 
 import voluptuous as vol
 
@@ -16,11 +17,13 @@ from homeassistant.components.stt import (
     Provider,
     SpeechMetadata,
     SpeechResult,
+    SpeechResultState,
 )
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 import homeassistant.helpers.config_validation as cv
 
+from .audio_processing import async_process_pcm_stream
 from .http_client import OpenAIHTTPClient
 from .websocket_client import OpenAIWebSocketClient
 
@@ -33,6 +36,10 @@ CONF_PROMPT = "prompt"
 CONF_TEMP = "temperature"
 CONF_REALTIME = "realtime"
 CONF_NOISE_REDUCTION = "noise_reduction"
+CONF_DEBUG_SAVE = "debug_save"
+CONF_PITCH_UP_VOCODER = "pitch_up_vocoder"
+CONF_PITCH_SEMITONES = "pitch_semitones"
+CONF_VOCODER_STRENGTH = "vocoder_strength"
 
 DEFAULT_API_URL = "https://api.openai.com/v1"
 DEFAULT_MODEL = "gpt-4o-mini-transcribe"
@@ -40,6 +47,10 @@ DEFAULT_PROMPT = ""
 DEFAULT_TEMP = 0
 DEFAULT_REALTIME = False
 DEFAULT_NOISE_REDUCTION = None
+DEFAULT_DEBUG_SAVE = False
+DEFAULT_PITCH_UP_VOCODER = False
+DEFAULT_PITCH_SEMITONES = 1.0
+DEFAULT_VOCODER_STRENGTH = 0.15
 
 SUPPORTED_MODELS = [
     "whisper-1",
@@ -118,6 +129,14 @@ SUPPORTED_LANGUAGES = [
 MODEL_SCHEMA = vol.In(SUPPORTED_MODELS)
 NOISE_REDUCTION_SCHEMA = vol.In(SUPPORTED_NOISE_REDUCTION)
 
+
+def _finite_float(value: float) -> float:
+    """Reject YAML .nan/.inf values, including NaN that evades range checks."""
+    if not math.isfinite(value):
+        raise vol.Invalid("value must be finite")
+    return value
+
+
 PLATFORM_SCHEMA = cv.PLATFORM_SCHEMA.extend(
     {
         vol.Required(CONF_API_KEY): cv.string,
@@ -129,6 +148,16 @@ PLATFORM_SCHEMA = cv.PLATFORM_SCHEMA.extend(
         vol.Optional(
             CONF_NOISE_REDUCTION, default=DEFAULT_NOISE_REDUCTION
         ): NOISE_REDUCTION_SCHEMA,
+        vol.Optional(CONF_DEBUG_SAVE, default=DEFAULT_DEBUG_SAVE): cv.boolean,
+        vol.Optional(
+            CONF_PITCH_UP_VOCODER, default=DEFAULT_PITCH_UP_VOCODER
+        ): cv.boolean,
+        vol.Optional(CONF_PITCH_SEMITONES, default=DEFAULT_PITCH_SEMITONES): vol.All(
+            vol.Coerce(float), vol.Range(min=-12.0, max=12.0), _finite_float
+        ),
+        vol.Optional(CONF_VOCODER_STRENGTH, default=DEFAULT_VOCODER_STRENGTH): vol.All(
+            vol.Coerce(float), vol.Range(min=0.0, max=1.0), _finite_float
+        ),
     }
 )
 
@@ -146,7 +175,18 @@ async def async_get_engine(
     noise_reduction = config.get(CONF_NOISE_REDUCTION, DEFAULT_NOISE_REDUCTION)
 
     return OpenAISTTProvider(
-        hass, api_key, api_url, model, prompt, temperature, realtime, noise_reduction
+        hass,
+        api_key,
+        api_url,
+        model,
+        prompt,
+        temperature,
+        realtime,
+        noise_reduction,
+        debug_save=config.get(CONF_DEBUG_SAVE, DEFAULT_DEBUG_SAVE),
+        pitch_up_vocoder=config.get(CONF_PITCH_UP_VOCODER, DEFAULT_PITCH_UP_VOCODER),
+        pitch_semitones=config.get(CONF_PITCH_SEMITONES, DEFAULT_PITCH_SEMITONES),
+        vocoder_strength=config.get(CONF_VOCODER_STRENGTH, DEFAULT_VOCODER_STRENGTH),
     )
 
 
@@ -162,7 +202,12 @@ class OpenAISTTProvider(Provider):
         prompt: str,
         temperature: int,
         realtime: bool,
-        noise_reduction: str,
+        noise_reduction: str | None,
+        *,
+        debug_save: bool = DEFAULT_DEBUG_SAVE,
+        pitch_up_vocoder: bool = DEFAULT_PITCH_UP_VOCODER,
+        pitch_semitones: float = DEFAULT_PITCH_SEMITONES,
+        vocoder_strength: float = DEFAULT_VOCODER_STRENGTH,
     ) -> None:
         """Init OpenAI STT service."""
         self.hass = hass
@@ -175,7 +220,19 @@ class OpenAISTTProvider(Provider):
         self._temperature = temperature
         self._realtime = realtime
         self._noise_reduction = noise_reduction
+        self._pitch_up_vocoder = pitch_up_vocoder
+        self._pitch_semitones = pitch_semitones
+        self._vocoder_strength = vocoder_strength
+        self._debug_directory = (
+            hass.config.path("openai_stt_debug") if debug_save else None
+        )
         self._client = self._create_client()
+        if debug_save:
+            _LOGGER.warning(
+                "OpenAI STT debug_save is enabled: outgoing speech is saved to %s. "
+                "Recordings contain sensitive content and must be deleted manually",
+                self._debug_directory,
+            )
 
     @property
     def supported_languages(self) -> list[str]:
@@ -185,12 +242,14 @@ class OpenAISTTProvider(Provider):
     @property
     def supported_formats(self) -> list[AudioFormats]:
         """Return a list of supported formats."""
-        return [AudioFormats.WAV, AudioFormats.OGG]
+        # Assist supplies raw PCM for WAV/PCM metadata. Neither transport
+        # decodes OGG/Opus, so do not advertise compressed audio support.
+        return [AudioFormats.WAV]
 
     @property
     def supported_codecs(self) -> list[AudioCodecs]:
         """Return a list of supported codecs."""
-        return [AudioCodecs.PCM, AudioCodecs.OPUS]
+        return [AudioCodecs.PCM]
 
     @property
     def supported_bit_rates(self) -> list[AudioBitRates]:
@@ -218,6 +277,8 @@ class OpenAISTTProvider(Provider):
                 self._model,
                 self._prompt,
                 self._noise_reduction,
+                debug_directory=self._debug_directory,
+                executor=self.hass.async_add_executor_job,
             )
 
         # Use HTTP client for OpenAI Transcription API
@@ -228,6 +289,8 @@ class OpenAISTTProvider(Provider):
             self._model,
             self._prompt,
             self._temperature,
+            debug_directory=self._debug_directory,
+            executor=self.hass.async_add_executor_job,
         )
 
     async def async_process_audio_stream(
@@ -237,4 +300,27 @@ class OpenAISTTProvider(Provider):
         _LOGGER.debug(
             "Processing audio stream with %s", self._client.__class__.__name__
         )
-        return await self._client.async_process_audio_stream(metadata, stream)
+        if (
+            metadata.format != AudioFormats.WAV
+            or metadata.codec != AudioCodecs.PCM
+            or int(metadata.channel) != 1
+            or int(metadata.bit_rate) != 16
+            or int(metadata.sample_rate) != 16000
+        ):
+            _LOGGER.error("OpenAI STT requires raw mono PCM16 at 16000 Hz")
+            return SpeechResult("", SpeechResultState.ERROR)
+
+        if self._pitch_up_vocoder:
+            stream = async_process_pcm_stream(
+                stream,
+                int(metadata.sample_rate),
+                self._pitch_semitones,
+                self._vocoder_strength,
+                self.hass.async_add_executor_job,
+            )
+        try:
+            return await self._client.async_process_audio_stream(metadata, stream)
+        except Exception:
+            # Never fall back to uploading the original voice after a DSP error.
+            _LOGGER.exception("Failed to prepare/process OpenAI STT audio")
+            return SpeechResult("", SpeechResultState.ERROR)

@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterable
+from collections.abc import AsyncIterable, Awaitable, Callable
 import io
 import logging
 import time
+from typing import Any
 import wave
 
 from aiohttp import ClientError, ClientResponseError, FormData
 
 from homeassistant.components.stt import SpeechMetadata, SpeechResult, SpeechResultState
+
+from .debug_audio import async_save_debug_audio
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -26,6 +29,9 @@ class OpenAIHTTPClient:
         model: str,
         prompt: str,
         temperature: int,
+        *,
+        debug_directory: str | None = None,
+        executor: Callable[..., Awaitable[Any]] | None = None,
     ) -> None:
         """Initialize the HTTP client."""
         self.client = client
@@ -34,12 +40,15 @@ class OpenAIHTTPClient:
         self.model = model
         self.prompt = prompt
         self.temperature = temperature
+        self.debug_directory = debug_directory
+        self._executor = executor
 
     async def _collect_audio_data(self, stream: AsyncIterable[bytes]) -> bytes:
         """Collect all audio data from the stream."""
-        audio_data = b""
+        chunks = []
         async for chunk in stream:
-            audio_data += chunk
+            chunks.append(chunk)
+        audio_data = b"".join(chunks)
         _LOGGER.debug("Audio data size: %d bytes", len(audio_data))
         return audio_data
 
@@ -140,6 +149,10 @@ class OpenAIHTTPClient:
         # Collect and convert audio data
         audio_data = await self._collect_audio_data(stream)
         wav_data = self._convert_to_wav(metadata, audio_data)
+        # Save precisely the same processed WAV bytes used in the file field.
+        await async_save_debug_audio(
+            self.debug_directory, wav_data, "http", executor=self._executor
+        )
 
         # Prepare request data
         headers, form = self._prepare_request_data(metadata.language, wav_data)
