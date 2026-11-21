@@ -32,6 +32,7 @@ _LOGGER = logging.getLogger(__name__)
 CONF_API_KEY = "api_key"
 CONF_API_URL = "api_url"
 CONF_MODEL = "model"
+CONF_LANGUAGE = "language"
 CONF_PROMPT = "prompt"
 CONF_TEMP = "temperature"
 CONF_REALTIME = "realtime"
@@ -43,6 +44,7 @@ CONF_VOCODER_STRENGTH = "vocoder_strength"
 
 DEFAULT_API_URL = "https://api.openai.com/v1"
 DEFAULT_MODEL = "gpt-4o-mini-transcribe"
+DEFAULT_LANGUAGE = None
 DEFAULT_PROMPT = ""
 DEFAULT_TEMP = 0
 DEFAULT_REALTIME = False
@@ -127,6 +129,7 @@ SUPPORTED_LANGUAGES = [
 ]
 
 MODEL_SCHEMA = vol.In(SUPPORTED_MODELS)
+LANGUAGE_SCHEMA = vol.Any(None, vol.In(SUPPORTED_LANGUAGES))
 NOISE_REDUCTION_SCHEMA = vol.In(SUPPORTED_NOISE_REDUCTION)
 
 
@@ -142,6 +145,7 @@ PLATFORM_SCHEMA = cv.PLATFORM_SCHEMA.extend(
         vol.Required(CONF_API_KEY): cv.string,
         vol.Optional(CONF_API_URL, default=DEFAULT_API_URL): cv.string,
         vol.Optional(CONF_MODEL, default=DEFAULT_MODEL): MODEL_SCHEMA,
+        vol.Optional(CONF_LANGUAGE, default=DEFAULT_LANGUAGE): LANGUAGE_SCHEMA,
         vol.Optional(CONF_PROMPT, default=DEFAULT_PROMPT): cv.string,
         vol.Optional(CONF_TEMP, default=DEFAULT_TEMP): cv.positive_int,
         vol.Optional(CONF_REALTIME, default=DEFAULT_REALTIME): cv.boolean,
@@ -183,6 +187,7 @@ async def async_get_engine(
         temperature,
         realtime,
         noise_reduction,
+        language=config.get(CONF_LANGUAGE, DEFAULT_LANGUAGE),
         debug_save=config.get(CONF_DEBUG_SAVE, DEFAULT_DEBUG_SAVE),
         pitch_up_vocoder=config.get(CONF_PITCH_UP_VOCODER, DEFAULT_PITCH_UP_VOCODER),
         pitch_semitones=config.get(CONF_PITCH_SEMITONES, DEFAULT_PITCH_SEMITONES),
@@ -204,6 +209,7 @@ class OpenAISTTProvider(Provider):
         realtime: bool,
         noise_reduction: str | None,
         *,
+        language: str | None = DEFAULT_LANGUAGE,
         debug_save: bool = DEFAULT_DEBUG_SAVE,
         pitch_up_vocoder: bool = DEFAULT_PITCH_UP_VOCODER,
         pitch_semitones: float = DEFAULT_PITCH_SEMITONES,
@@ -216,6 +222,7 @@ class OpenAISTTProvider(Provider):
         self._api_key = api_key
         self._api_url = api_url
         self._model = model
+        self._language = language
         self._prompt = prompt
         self._temperature = temperature
         self._realtime = realtime
@@ -277,6 +284,7 @@ class OpenAISTTProvider(Provider):
                 self._model,
                 self._prompt,
                 self._noise_reduction,
+                language=self._language,
                 debug_directory=self._debug_directory,
                 executor=self.hass.async_add_executor_job,
             )
@@ -289,6 +297,7 @@ class OpenAISTTProvider(Provider):
             self._model,
             self._prompt,
             self._temperature,
+            language=self._language,
             debug_directory=self._debug_directory,
             executor=self.hass.async_add_executor_job,
         )

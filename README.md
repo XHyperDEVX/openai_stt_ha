@@ -32,6 +32,7 @@ stt:
     realtime: false
     api_url: https://api.openai.com/v1
     model: gpt-4o-mini-transcribe
+    language: de
     prompt: ""
     temperature: 0
     noise_reduction: null
@@ -47,6 +48,7 @@ stt:
 - `realtime` (Optional): If set to `true`, the integration will use the OpenAI Realtime API. This should generate faster results. If set to `false`, the integration will use the regular OpenAI Transcription API. The default is `false`. Keep in mind that the Realtime API is currently in beta and may not be as stable as the Transcription API. See the [OpenAI documentation](https://platform.openai.com/docs/guides/realtime-transcription) for more information
 - `api_url` (Optional): The API URL to use. Specify this to use any compatible OpenAI API. The default is `https://api.openai.com/v1`.
 - `model` (Optional): The model to use. Currently, the [supported models](#supported-models) are `gpt-4o-mini-transcribe`, `gpt-4o-transcribe` and `whisper-1`. The default is `gpt-4o-mini-transcribe`. All available models are listed in the [OpenAI model list](https://platform.openai.com/docs/models) under the Transcription section
+- `language` (Optional): Fix the input language used for transcription with a supported lowercase ISO 639-1 code, e.g. `de` for German or `en` for English (not `de-DE` or `German`). This overrides the language supplied by the Home Assistant Assist pipeline. Omit it or set it to `null` to keep using the pipeline language (the default). Supported by HTTP transcription and by the Realtime model `gpt-live-transcribe` (including the aliases `gpt-4o-mini-transcribe` and `whisper-1`). The Realtime model `gpt-transcribe` (including the alias `gpt-4o-transcribe`) detects the language automatically and does not accept this hint; an explicitly configured `language` logs a warning for that model. This is an API language hint, not translation or a guaranteed filter that rejects speech in other languages.
 - `prompt` (Optional): The prompt to use. The default is an empty string. See the [OpenAI documentation](https://platform.openai.com/docs/guides/speech-to-text#prompting) for more information
 - `temperature` (Optional): The temperature to use between `0` and `1`. A higher temperature will make the model more creative, but less accurate. The default is `0`. Only applicable when `realtime: false`
 - `noise_reduction` (Optional): The noise reduction to use. The available options are `null`, `near_field` and `far_field`. `near_field` is for close-range audio, `far_field` is for distant audio, `null` turns off noise reduction. The default is `null`. Only applicable when `realtime: true`
@@ -150,7 +152,8 @@ Assistant**. Existing installations have both new switches disabled by default.
 ### Development checks
 
 The tests cover PCM duration, neutral reconstruction, pitch, chunk boundaries,
-validation, outgoing debug payloads, and failure handling. Transport/provider
+validation, configured language overrides and pipeline-language fallback for both
+transports, outgoing debug payloads, and failure handling. Transport/provider
 tests use small Home Assistant stubs and do not contact OpenAI; they are not a
 substitute for an Assist end-to-end test or an intelligibility evaluation.
 

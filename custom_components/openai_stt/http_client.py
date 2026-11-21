@@ -30,6 +30,7 @@ class OpenAIHTTPClient:
         prompt: str,
         temperature: int,
         *,
+        language: str | None = None,
         debug_directory: str | None = None,
         executor: Callable[..., Awaitable[Any]] | None = None,
     ) -> None:
@@ -40,6 +41,7 @@ class OpenAIHTTPClient:
         self.model = model
         self.prompt = prompt
         self.temperature = temperature
+        self.language = language
         self.debug_directory = debug_directory
         self._executor = executor
 
@@ -65,7 +67,8 @@ class OpenAIHTTPClient:
     def _prepare_request_data(
         self, language: str, wav_data: bytes
     ) -> tuple[dict, FormData]:
-        """Prepare headers and form data for the API request."""
+        """Prepare headers and form data, preferring the configured language."""
+        language = self.language if self.language is not None else language
         headers = {
             "Authorization": f"Bearer {self.api_key}",
         }

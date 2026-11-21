@@ -123,6 +123,7 @@ class OpenAIWebSocketClient:
         prompt: str,
         noise_reduction: str | None,
         *,
+        language: str | None = None,
         debug_directory: str | None = None,
         executor: Callable[..., Awaitable[Any]] | None = None,
     ) -> None:
@@ -133,6 +134,7 @@ class OpenAIWebSocketClient:
         self.transcription_model = REALTIME_MODEL_ALIASES.get(model, model)
         self.prompt = prompt
         self.noise_reduction = noise_reduction
+        self.language = language
         self.debug_directory = debug_directory
         self._executor = executor
 
@@ -143,8 +145,18 @@ class OpenAIWebSocketClient:
                 self.transcription_model,
             )
 
+        if language is not None and self.transcription_model != "gpt-live-transcribe":
+            _LOGGER.warning(
+                "Configured language '%s' cannot be sent as a language hint to "
+                "Realtime model '%s'; it detects the language automatically. "
+                "Use gpt-live-transcribe for Realtime language hints",
+                language,
+                self.transcription_model,
+            )
+
     def _create_session_config(self, language: str) -> dict:
-        """Create a session.update event for the current Realtime API."""
+        """Create a session.update event, preferring the configured language."""
+        language = self.language if self.language is not None else language
         transcription: dict = {"model": self.transcription_model}
 
         if self.prompt:

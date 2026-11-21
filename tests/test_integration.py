@@ -161,6 +161,7 @@ class FakeWebSocket:
 class ConfigurationTests(unittest.TestCase):
     def test_defaults_and_requested_yaml_options(self):
         config = STT.PLATFORM_SCHEMA({"platform": "openai_stt", "api_key": "test"})
+        self.assertIsNone(config["language"])
         self.assertFalse(config["debug_save"])
         self.assertFalse(config["pitch_up_vocoder"])
         self.assertEqual(config["pitch_semitones"], 1.0)
@@ -173,6 +174,25 @@ class ConfigurationTests(unittest.TestCase):
         })
         self.assertTrue(config["debug_save"])
         self.assertTrue(config["pitch_up_vocoder"])
+
+    def test_accepts_supported_language_codes_and_null(self):
+        for language in (*STT.SUPPORTED_LANGUAGES, None):
+            with self.subTest(language=language):
+                config = STT.PLATFORM_SCHEMA({
+                    "platform": "openai_stt", "api_key": "test", "language": language,
+                })
+                self.assertEqual(config["language"], language)
+
+    def test_rejects_invalid_language_codes_and_types(self):
+        for language in (
+            "", "de-DE", "DE", "German", "deutsch", "xx", 1, False,
+            ["de"], {"code": "de"},
+        ):
+            with self.subTest(language=language):
+                with self.assertRaises(vol.Invalid):
+                    STT.PLATFORM_SCHEMA({
+                        "platform": "openai_stt", "api_key": "test", "language": language,
+                    })
 
     def test_rejects_invalid_ranges_and_nonfinite_numbers(self):
         for key, values in (
@@ -199,6 +219,95 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
     def http_payload(hass):
         form = hass.session.post.await_args.kwargs["data"]
         return next(value for options, _, value in form._fields if options["name"] == "file")
+
+    async def test_http_language_override_and_pipeline_fallback(self):
+        cases = (
+            ({}, "fr"),
+            ({"language": None}, "fr"),
+            ({"language": "de"}, "de"),
+            ({"language": "en"}, "en"),
+        )
+        with tempfile.TemporaryDirectory() as root:
+            for model in ("gpt-4o-mini-transcribe", "gpt-4o-transcribe", "whisper-1"):
+                for options, expected in cases:
+                    with self.subTest(model=model, options=options):
+                        provider, hass = await self.provider(root, model=model, **options)
+                        info = metadata()
+                        info.language = "fr"
+                        result = await provider.async_process_audio_stream(
+                            info, source(make_pcm())
+                        )
+                        self.assertEqual(result.result, SpeechResultState.SUCCESS)
+                        form = hass.session.post.await_args.kwargs["data"]
+                        languages = [
+                            value for field, _, value in form._fields
+                            if field["name"] == "language"
+                        ]
+                        self.assertEqual(languages, [expected])
+                        self.assertEqual(info.language, "fr")
+                        self.assertIn("fr", provider.supported_languages)
+
+    async def test_realtime_language_override_and_pipeline_fallback(self):
+        cases = (
+            ({}, "fr"),
+            ({"language": None}, "fr"),
+            ({"language": "de"}, "de"),
+            ({"language": "en"}, "en"),
+        )
+        with tempfile.TemporaryDirectory() as root:
+            for model in ("gpt-live-transcribe", "gpt-4o-mini-transcribe", "whisper-1"):
+                for options, expected in cases:
+                    with self.subTest(model=model, options=options):
+                        provider, hass = await self.provider(
+                            root, realtime=True, model=model, **options,
+                        )
+                        ws = FakeWebSocket()
+                        connection = AsyncMock()
+                        connection.__aenter__.return_value = ws
+                        hass.session.ws_connect = Mock(return_value=connection)
+                        info = metadata()
+                        info.language = "fr"
+                        with patch.object(
+                            provider._client, "_run_stream",
+                            new_callable=AsyncMock, return_value="Licht an",
+                        ):
+                            result = await provider.async_process_audio_stream(
+                                info, source(make_pcm())
+                            )
+                        self.assertEqual(result.result, SpeechResultState.SUCCESS)
+                        event, = ws.events
+                        self.assertEqual(event["type"], "session.update")
+                        transcription = event["session"]["audio"]["input"]["transcription"]
+                        self.assertEqual(transcription["model"], "gpt-live-transcribe")
+                        self.assertEqual(transcription["languages"], [expected])
+                        self.assertNotIn("language", transcription)
+                        self.assertEqual(info.language, "fr")
+                        self.assertIn("fr", provider.supported_languages)
+
+    async def test_realtime_model_without_language_support_warns(self):
+        with tempfile.TemporaryDirectory() as root:
+            for model in ("gpt-transcribe", "gpt-4o-transcribe"):
+                with self.subTest(model=model):
+                    with self.assertLogs(WS.__name__, level="WARNING") as logs:
+                        provider, _ = await self.provider(
+                            root, realtime=True, model=model, language="de",
+                        )
+                    self.assertIn("cannot be sent as a language hint", logs.output[0])
+                    self.assertIn("gpt-live-transcribe", logs.output[0])
+                    config = provider._client._create_session_config("fr")
+                    transcription = config["session"]["audio"]["input"]["transcription"]
+                    self.assertEqual(transcription["model"], "gpt-transcribe")
+                    self.assertNotIn("language", transcription)
+                    self.assertNotIn("languages", transcription)
+
+    async def test_realtime_automatic_language_without_override_does_not_warn(self):
+        with tempfile.TemporaryDirectory() as root:
+            with patch.object(WS._LOGGER, "warning") as warning:
+                await self.provider(root, realtime=True, model="gpt-transcribe")
+                await self.provider(
+                    root, realtime=True, model="gpt-transcribe", language=None,
+                )
+                warning.assert_not_called()
 
     async def test_http_processed_capture_equals_uploaded_wav(self):
         with tempfile.TemporaryDirectory() as root:
